@@ -77,36 +77,72 @@ class HandDetectionApp:
         Returns:
             bool: True if successful
         """
-        try:
-            self.camera = cv2.VideoCapture(settings.CAMERA_DEVICE)
-            
-            # Set camera properties
-            self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_width)
-            self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_height)
-            self.camera.set(cv2.CAP_PROP_FPS, settings.CAMERA_FPS)
-            
-            # Set auto focus if supported
-            if settings.USE_AUTO_FOCUS:
+        candidate_devices = []
+        for device_index in [settings.CAMERA_DEVICE, 0, 1, 2, 3]:
+            if device_index not in candidate_devices:
+                candidate_devices.append(device_index)
+
+        candidate_backends = [
+            cv2.CAP_DSHOW,
+            cv2.CAP_MSMF,
+            0,
+        ]
+
+        for device_index in candidate_devices:
+            for backend in candidate_backends:
+                capture = None
                 try:
-                    self.camera.set(cv2.CAP_PROP_AUTOFOCUS, 1)
-                except:
-                    pass  # Not all cameras support this
-            
-            # Test capture
-            ret, frame = self.camera.read()
-            if not ret:
-                logger.error("Failed to read from camera")
-                return False
-            
-            # Get actual frame dimensions
-            self.frame_height, self.frame_width = frame.shape[:2]
-            logger.info(f"Camera initialized: {self.frame_width}x{self.frame_height}")
-            
-            return True
-        
-        except Exception as e:
-            logger.error(f"Camera initialization failed: {e}")
-            return False
+                    capture = cv2.VideoCapture(device_index, backend) if backend else cv2.VideoCapture(device_index)
+                    if not capture.isOpened():
+                        if capture is not None:
+                            capture.release()
+                        continue
+
+                    # Set camera properties
+                    capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_width)
+                    capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_height)
+                    capture.set(cv2.CAP_PROP_FPS, settings.CAMERA_FPS)
+
+                    # Set auto focus if supported
+                    if settings.USE_AUTO_FOCUS:
+                        try:
+                            capture.set(cv2.CAP_PROP_AUTOFOCUS, 1)
+                        except Exception:
+                            pass  # Not all cameras support this
+
+                    # Warm up the camera with a couple of reads
+                    frame = None
+                    ret = False
+                    for _ in range(2):
+                        ret, frame = capture.read()
+                        if ret:
+                            break
+
+                    if not ret or frame is None:
+                        logger.warning(
+                            f"Camera open failed on device {device_index} with backend {backend}; trying next option"
+                        )
+                        capture.release()
+                        continue
+
+                    # Success
+                    self.camera = capture
+                    self.frame_height, self.frame_width = frame.shape[:2]
+                    logger.info(
+                        f"Camera initialized: device={device_index}, backend={backend}, "
+                        f"resolution={self.frame_width}x{self.frame_height}"
+                    )
+                    return True
+
+                except Exception as e:
+                    logger.warning(
+                        f"Camera init failed on device {device_index} with backend {backend}: {e}"
+                    )
+                    if capture is not None:
+                        capture.release()
+
+        logger.error("Failed to initialize camera with all available device/backend combinations")
+        return False
     
     def process_frame(self, frame) -> dict:
         """

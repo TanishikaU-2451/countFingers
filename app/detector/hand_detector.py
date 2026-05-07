@@ -1,18 +1,27 @@
 """
-Hand detection using MediaPipe Hands.
+Hand detection using MediaPipe Hands (Tasks API v0.10+).
 
 This module provides real-time hand detection and landmark extraction
 for up to 2 hands using MediaPipe's hand detection models.
 """
 
 import cv2
-import mediapipe as mp
 import numpy as np
 from typing import Optional, List
+import os
+import time
+import urllib.request
+import tempfile
+import shutil
 
 from app.config import settings
 from app.detector.landmarks import Landmark, Hand, HandsData
 from app.utils.logger import logger
+
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+from mediapipe.tasks.python.vision.core import image as mp_image
+from mediapipe.tasks.python import vision as mp_vision
 
 
 class HandDetector:
@@ -27,23 +36,94 @@ class HandDetector:
     """
     
     def __init__(self):
-        """Initialize MediaPipe hands detector."""
-        self.mp_hands = mp.solutions.hands
-        self.hands = self.mp_hands.Hands(
-            static_image_mode=False,
-            max_num_hands=settings.MAX_HANDS,
-            model_complexity=settings.MODEL_COMPLEXITY,
-            min_detection_confidence=settings.HAND_DETECTION_CONFIDENCE,
-            min_tracking_confidence=settings.HAND_TRACKING_CONFIDENCE,
-        )
-        
+        """Initialize MediaPipe hands detector using Tasks API (v0.10+)."""
         self.frame_width = 0
         self.frame_height = 0
+        self.hands = None
+        self.enabled = True
+        self._last_timestamp_ms = 0
         
-        logger.info(
-            f"HandDetector initialized with max_hands={settings.MAX_HANDS}, "
-            f"confidence={settings.HAND_DETECTION_CONFIDENCE}"
-        )
+        try:
+            # Determine path to local model
+            assets_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'assets')
+            model_filename = 'hand_landmarker.task'
+            model_path = os.path.abspath(os.path.join(assets_dir, model_filename))
+
+            # If assets folder missing, create it
+            os.makedirs(assets_dir, exist_ok=True)
+
+            # If model not present, attempt to download it
+            if not os.path.exists(model_path):
+                logger.info(f"Model not found at {model_path}; attempting download...")
+                try:
+                    self._download_default_model(model_path)
+                    logger.info(f"Downloaded hand_landmarker.task to {model_path}")
+                except Exception as de:
+                    logger.warning(f"Model download failed: {de}")
+
+            # Build BaseOptions with model path if available, otherwise default
+            if os.path.exists(model_path):
+                base_options = python.BaseOptions(model_asset_path=model_path)
+            else:
+                base_options = python.BaseOptions()
+
+            # Create hand landmarker options (use base_options)
+            options = vision.HandLandmarkerOptions(
+                base_options=base_options,
+                running_mode=mp_vision.RunningMode.VIDEO,
+                num_hands=settings.MAX_HANDS,
+                min_hand_detection_confidence=settings.HAND_DETECTION_CONFIDENCE,
+                min_hand_presence_confidence=settings.HAND_TRACKING_CONFIDENCE,
+                min_tracking_confidence=settings.HAND_TRACKING_CONFIDENCE,
+            )
+
+            # Create the hand landmarker
+            self.hands = vision.HandLandmarker.create_from_options(options)
+            logger.info(
+                f"HandDetector initialized with max_hands={settings.MAX_HANDS}, "
+                f"confidence={settings.HAND_DETECTION_CONFIDENCE}"
+            )
+        except Exception as e:
+            # If model file or bundled model is not available, disable detector
+            logger.error(f"Failed to initialize HandDetector: {e}")
+            logger.warning(
+                "Hand detection disabled — provide a hand_landmarker.task model in assets/ "
+                "or install a MediaPipe build that bundles models. Continuing without detection."
+            )
+            self.hands = None
+            self.enabled = False
+
+    def _download_default_model(self, destination_path: str):
+        """Download a default hand_landmarker.task model to the given path.
+
+        Uses the Google-hosted mediapipe assets bucket if reachable. This
+        function uses urllib to avoid adding new dependencies.
+        """
+        # Official assets location (may change); fallback will raise on failure
+        default_urls = [
+            'https://storage.googleapis.com/mediapipe-assets/hand_landmarker.task',
+            'https://storage.googleapis.com/mediapipe/hand_landmarker.task'
+        ]
+
+        last_err = None
+        for url in default_urls:
+            try:
+                tmp_fd, tmp_path = tempfile.mkstemp(suffix='.task')
+                os.close(tmp_fd)
+                with urllib.request.urlopen(url, timeout=30) as resp, open(tmp_path, 'wb') as out:
+                    shutil.copyfileobj(resp, out)
+                # move into place
+                os.replace(tmp_path, destination_path)
+                return
+            except Exception as e:
+                last_err = e
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except Exception:
+                    pass
+
+        raise RuntimeError(f"Failed to download model: {last_err}")
     
     def detect(self, frame: np.ndarray) -> HandsData:
         """
@@ -57,30 +137,69 @@ class HandDetector:
         """
         # Store frame dimensions for later use
         self.frame_height, self.frame_width = frame.shape[:2]
-        
+        # If detector not enabled, return empty result
+        if not getattr(self, 'enabled', True) or self.hands is None:
+            return HandsData()
+
         # Convert BGR to RGB for MediaPipe
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
-        # Process frame with MediaPipe
-        results = self.hands.process(frame_rgb)
+        # Create MediaImage
+        media_image = mp_image.Image(
+            image_format=mp_image.ImageFormat.SRGB,
+            data=frame_rgb
+        )
+
+        # MediaPipe video mode requires strictly increasing timestamps.
+        timestamp_ms = int(time.monotonic() * 1000)
+        if timestamp_ms <= self._last_timestamp_ms:
+            timestamp_ms = self._last_timestamp_ms + 1
+        self._last_timestamp_ms = timestamp_ms
+        
+        # Detect hands
+        try:
+            detection_result = self.hands.detect_for_video(media_image, timestamp_ms)
+        except Exception as e:
+            logger.warning(f"Detection error: {e}")
+            return HandsData()
         
         # Container for detected hands
         hands_data = HandsData()
         
         # Extract detections
-        if results.multi_hand_landmarks and results.multi_handedness:
-            for hand_landmarks, handedness_info in zip(
-                results.multi_hand_landmarks,
-                results.multi_handedness
-            ):
+        if detection_result.hand_landmarks and detection_result.handedness:
+            for index, hand_landmarks in enumerate(detection_result.hand_landmarks):
+                handedness_info = None
+                if index < len(detection_result.handedness):
+                    handedness_entry = detection_result.handedness[index]
+                    if isinstance(handedness_entry, list):
+                        handedness_info = handedness_entry[0] if handedness_entry else None
+                    else:
+                        handedness_info = handedness_entry
+
                 # Extract landmarks
-                landmarks = self._extract_landmarks(hand_landmarks)
+                landmarks = []
+                for lm in hand_landmarks:
+                    landmark = Landmark(
+                        x=lm.x,
+                        y=lm.y,
+                        z=lm.z,
+                        visibility=getattr(lm, 'presence', 0.0),
+                    )
+                    landmarks.append(landmark)
                 
-                # Get handedness with mirror correction
-                handedness = self._get_handedness(handedness_info)
-                
-                # Get confidence
-                confidence = handedness_info.classification[0].score
+                # Get handedness
+                label = "Unknown"
+                confidence = 0.0
+                if handedness_info is not None:
+                    label = getattr(handedness_info, 'category_name', None) or getattr(handedness_info, 'label', 'Unknown')
+                    confidence = getattr(handedness_info, 'score', 0.0)
+
+                # Apply mirror correction for front-facing camera
+                if settings.FLIP_FRAME_HORIZONTALLY:
+                    handedness = "Left" if label == "Right" else "Right"
+                else:
+                    handedness = label
                 
                 # Create Hand object
                 hand = Hand(
@@ -95,57 +214,9 @@ class HandDetector:
         
         return hands_data
     
-    def _extract_landmarks(self, hand_landmarks) -> List[Landmark]:
-        """
-        Extract landmarks from MediaPipe results.
-        
-        Args:
-            hand_landmarks: MediaPipe hand landmarks object
-        
-        Returns:
-            List: List of 21 Landmark objects
-        """
-        landmarks = []
-        for lm in hand_landmarks.landmark:
-            landmark = Landmark(
-                x=lm.x,
-                y=lm.y,
-                z=lm.z,
-                visibility=lm.visibility,
-            )
-            landmarks.append(landmark)
-        return landmarks
-    
-    def _get_handedness(self, handedness_info) -> str:
-        """
-        Get handedness with mirror correction for selfie images.
-        
-        MediaPipe assumes front-facing camera (selfie). For standard webcam
-        with mirror effect, we apply a correction to get intuitive results.
-        
-        Args:
-            handedness_info: MediaPipe handedness classification
-        
-        Returns:
-            str: 'Left' or 'Right'
-        """
-        # Get the label from MediaPipe
-        label = handedness_info.classification[0].label
-        
-        # Apply mirror correction for front-facing camera
-        # Without correction: right hand shows as "Right" (MediaPipe is correct)
-        # We invert it so it matches user perspective
-        if settings.FLIP_FRAME_HORIZONTALLY:
-            # Mirror correction: invert handedness
-            return "Left" if label == "Right" else "Right"
-        else:
-            return label
-    
     def close(self):
         """Close MediaPipe resources."""
-        if self.hands:
-            self.hands.close()
-            logger.info("HandDetector closed")
+        logger.info("HandDetector closed")
 
 
 class FrameProcessor:

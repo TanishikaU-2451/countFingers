@@ -11,11 +11,11 @@ MAX_HANDS = 2
 
 # Minimum detection confidence threshold (0.0 - 1.0)
 # Higher values = more confident detections but fewer false positives
-HAND_DETECTION_CONFIDENCE = 0.7
+HAND_DETECTION_CONFIDENCE = 0.5
 
 # Minimum tracking confidence threshold (0.0 - 1.0)
 # Helps smooth detections across frames
-HAND_TRACKING_CONFIDENCE = 0.5
+HAND_TRACKING_CONFIDENCE = 0.45
 
 # Model complexity: 0 (lite, fast) or 1 (full, accurate)
 MODEL_COMPLEXITY = 0

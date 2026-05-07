@@ -3,6 +3,7 @@ Simple logging utility for the hand detection application.
 """
 
 import sys
+import traceback
 from datetime import datetime
 from app.config.settings import LOG_LEVEL
 
@@ -48,8 +49,10 @@ class Logger:
         """Log warning message."""
         self._log('WARNING', message)
     
-    def error(self, message):
+    def error(self, message, **kwargs):
         """Log error message."""
+        if kwargs.get('exc_info'):
+            message = f"{message}\n{traceback.format_exc().rstrip()}"
         self._log('ERROR', message)
 
 
