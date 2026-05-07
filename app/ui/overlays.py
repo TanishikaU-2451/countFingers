@@ -292,7 +292,7 @@ class DebugRenderer:
         frame: np.ndarray,
         hand: Hand,
         angle_values: dict,
-        color: Tuple = settings.YELLOW
+           color: Tuple = settings.COLOR_YELLOW
     ) -> None:
         """
         Draw angle values at joints for debugging.
